@@ -112,22 +112,332 @@ function extractTextFromAnthropicContent(content) {
     .join("");
 }
 
-function buildGeminiRequestFromAnthropic({ system, messages, temperature, top_p, max_tokens, stream }) {
+function normalizeAnthropicContentBlocks(content) {
+  if (Array.isArray(content)) return content;
+  if (typeof content === "string") return [{ type: "text", text: content }];
+  return [];
+}
+
+function extractTextFromAnthropicToolResultContent(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((block) => {
+      if (typeof block === "string") return block;
+      if (!block || typeof block !== "object") return "";
+      if (block.type === "text") return String(block.text || "");
+      return "";
+    })
+    .join("");
+}
+
+function normalizeGeminiFunctionCallArgs(args) {
+  if (args && typeof args === "object" && !Array.isArray(args)) return args;
+  if (typeof args === "string") {
+    try {
+      const parsed = JSON.parse(args);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed;
+    } catch {}
+  }
+  return {};
+}
+
+function extractGeminiFunctionCalls(candidate) {
+  const calls = [];
+  const directCall = candidate?.functionCall;
+  if (directCall && typeof directCall === "object") {
+    const name = typeof directCall.name === "string" ? directCall.name.trim() : "";
+    if (name) {
+      calls.push({ name, input: normalizeGeminiFunctionCallArgs(directCall.args) });
+    }
+  }
+
+  const parts = Array.isArray(candidate?.content?.parts) ? candidate.content.parts : [];
+  for (const part of parts) {
+    const functionCall = part?.functionCall;
+    if (!functionCall || typeof functionCall !== "object") continue;
+    const name = typeof functionCall.name === "string" ? functionCall.name.trim() : "";
+    if (!name) continue;
+    calls.push({ name, input: normalizeGeminiFunctionCallArgs(functionCall.args) });
+  }
+  return calls;
+}
+
+function normalizeStopSequences(stopSequences) {
+  if (!Array.isArray(stopSequences)) return [];
+  return stopSequences
+    .filter((s) => typeof s === "string")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+function deriveAnthropicStopState({ candidate, hasToolCall, stopSequences }) {
+  if (hasToolCall) {
+    return { stopReason: "tool_use", stopSequence: null };
+  }
+
+  const finishReason = String(candidate?.finishReason || "").toUpperCase();
+  if (finishReason === "MAX_TOKENS") {
+    return { stopReason: "max_tokens", stopSequence: null };
+  }
+
+  const normalizedStopSequences = normalizeStopSequences(stopSequences);
+  const finishMessage = String(candidate?.finishMessage || "").toLowerCase();
+  const text = extractTextFromGeminiCandidate(candidate);
+  const matchedStopSequence =
+    normalizedStopSequences.find((seq) => finishMessage.includes(seq.toLowerCase())) ||
+    normalizedStopSequences.find((seq) => text.includes(seq)) ||
+    null;
+
+  if (matchedStopSequence) {
+    return { stopReason: "stop_sequence", stopSequence: matchedStopSequence };
+  }
+
+  return { stopReason: "end_turn", stopSequence: null };
+}
+
+function normalizeAnthropicToolResultResponse(content, isError) {
+  const response = {};
+  if (content && typeof content === "object" && !Array.isArray(content)) {
+    Object.assign(response, content);
+  } else {
+    response.content = extractTextFromAnthropicToolResultContent(content);
+  }
+  if (isError === true) response.is_error = true;
+  return response;
+}
+
+function inferSchemaTypeFromEnumValues(values) {
+  if (!Array.isArray(values) || !values.length) return "string";
+  const first = values.find((value) => value !== null && value !== undefined);
+  if (typeof first === "number") return Number.isInteger(first) ? "integer" : "number";
+  if (typeof first === "boolean") return "boolean";
+  return "string";
+}
+
+function sanitizeGeminiSchema(schema) {
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) {
+    return { type: "object", properties: {} };
+  }
+
+  const anyOfCandidates = Array.isArray(schema.anyOf)
+    ? schema.anyOf
+    : Array.isArray(schema.oneOf)
+      ? schema.oneOf
+      : Array.isArray(schema.allOf)
+        ? schema.allOf
+        : [];
+  const anyOf = anyOfCandidates
+    .map((item) => sanitizeGeminiSchema(item))
+    .filter((item) => item && typeof item === "object");
+
+  const enumValues = Array.isArray(schema.enum) ? schema.enum.filter((v) => v !== undefined) : undefined;
+  const constValue = schema.const !== undefined ? [schema.const] : undefined;
+  const mergedEnum = enumValues?.length ? enumValues : constValue;
+
+  let type = typeof schema.type === "string" ? schema.type.toLowerCase() : "";
+  if (!type) {
+    if (Array.isArray(schema.type)) {
+      type = String(schema.type.find((t) => t && t !== "null") || "").toLowerCase();
+    } else if (schema.properties && typeof schema.properties === "object") {
+      type = "object";
+    } else if (schema.items) {
+      type = "array";
+    } else if (mergedEnum?.length) {
+      type = inferSchemaTypeFromEnumValues(mergedEnum);
+    } else {
+      type = "string";
+    }
+  }
+
+  if (!["object", "array", "string", "number", "integer", "boolean"].includes(type)) {
+    type = "string";
+  }
+
+  const result = { type };
+
+  if (typeof schema.description === "string" && schema.description.trim()) {
+    result.description = schema.description.trim();
+  }
+  if (typeof schema.format === "string" && schema.format.trim()) {
+    result.format = schema.format.trim();
+  }
+
+  const nullableFromTypeArray =
+    Array.isArray(schema.type) && schema.type.some((t) => String(t).toLowerCase() === "null");
+  if (schema.nullable === true || nullableFromTypeArray) {
+    result.nullable = true;
+  }
+
+  if (mergedEnum?.length) {
+    result.enum = mergedEnum;
+  }
+  if (typeof schema.minLength === "number") result.minLength = schema.minLength;
+  if (typeof schema.maxLength === "number") result.maxLength = schema.maxLength;
+  if (typeof schema.minimum === "number") result.minimum = schema.minimum;
+  if (typeof schema.maximum === "number") result.maximum = schema.maximum;
+  if (typeof schema.pattern === "string" && schema.pattern) result.pattern = schema.pattern;
+  if (typeof schema.minItems === "number") result.minItems = schema.minItems;
+  if (typeof schema.maxItems === "number") result.maxItems = schema.maxItems;
+
+  if (type === "object") {
+    const rawProperties = schema.properties && typeof schema.properties === "object" ? schema.properties : {};
+    const properties = {};
+    for (const [key, value] of Object.entries(rawProperties)) {
+      properties[key] = sanitizeGeminiSchema(value);
+    }
+    result.properties = properties;
+
+    if (Array.isArray(schema.required) && schema.required.length) {
+      result.required = schema.required.filter((name) => typeof name === "string" && properties[name]);
+    }
+  } else if (type === "array") {
+    result.items = sanitizeGeminiSchema(schema.items || { type: "string" });
+  }
+
+  if (anyOf.length) {
+    result.anyOf = anyOf;
+  }
+
+  return result;
+}
+
+function buildGeminiToolsFromAnthropic(tools) {
+  if (!Array.isArray(tools)) return undefined;
+  const functionDeclarations = [];
+  for (const tool of tools) {
+    if (!tool || typeof tool !== "object") continue;
+    const name = typeof tool.name === "string" ? tool.name.trim() : "";
+    if (!name) continue;
+    const declaration = {
+      name,
+      parameters:
+        tool.input_schema && typeof tool.input_schema === "object"
+          ? sanitizeGeminiSchema(tool.input_schema)
+          : { type: "object", properties: {} }
+    };
+    if (typeof tool.description === "string" && tool.description.trim()) {
+      declaration.description = tool.description.trim();
+    }
+    functionDeclarations.push(declaration);
+  }
+  if (!functionDeclarations.length) return undefined;
+  return [{ functionDeclarations }];
+}
+
+function buildGeminiToolConfigFromAnthropic(toolChoice) {
+  if (!toolChoice || typeof toolChoice !== "object") return undefined;
+  const type = typeof toolChoice.type === "string" ? toolChoice.type : "";
+  if (type === "auto") {
+    return { functionCallingConfig: { mode: "AUTO" } };
+  }
+  if (type === "any") {
+    return { functionCallingConfig: { mode: "ANY" } };
+  }
+  if (type === "tool") {
+    const name = typeof toolChoice.name === "string" ? toolChoice.name.trim() : "";
+    if (!name) return { functionCallingConfig: { mode: "ANY" } };
+    return { functionCallingConfig: { mode: "ANY", allowedFunctionNames: [name] } };
+  }
+  return undefined;
+}
+
+function extractAnthropicBlocksFromGeminiCandidate(candidate, stopSequences) {
+  const parts = Array.isArray(candidate?.content?.parts) ? candidate.content.parts : [];
+  const content = [];
+
+  for (const part of parts) {
+    if (typeof part?.text === "string" && part.text) {
+      content.push({ type: "text", text: part.text });
+    }
+
+  }
+
+  const calls = extractGeminiFunctionCalls(candidate);
+  for (const call of calls) {
+    content.push({
+      type: "tool_use",
+      id: randomId("toolu"),
+      name: call.name,
+      input: call.input
+    });
+  }
+
+  const hasToolCall = calls.length > 0;
+  const { stopReason, stopSequence } = deriveAnthropicStopState({
+    candidate,
+    hasToolCall,
+    stopSequences
+  });
+
+  return { content, stopReason, stopSequence };
+}
+
+function buildGeminiRequestFromAnthropic({
+  system,
+  messages,
+  temperature,
+  top_p,
+  max_tokens,
+  stream,
+  tools,
+  tool_choice,
+  stop_sequences
+}) {
   const systemText = extractTextFromAnthropicContent(system);
   const contents = [];
+  const toolUseNameById = new Map();
 
   for (const msg of Array.isArray(messages) ? messages : []) {
     if (!msg || typeof msg !== "object") continue;
     const role = msg.role;
-    const text = extractTextFromAnthropicContent(msg.content);
-    if (!text) continue;
+    const blocks = normalizeAnthropicContentBlocks(msg.content);
+    const parts = [];
+
+    for (const block of blocks) {
+      if (!block || typeof block !== "object") continue;
+
+      if (block.type === "text") {
+        const text = String(block.text || "");
+        if (text) parts.push({ text });
+        continue;
+      }
+
+      if (block.type === "tool_use") {
+        const name = typeof block.name === "string" ? block.name.trim() : "";
+        if (!name) continue;
+        const id = typeof block.id === "string" ? block.id : "";
+        if (id) toolUseNameById.set(id, name);
+        parts.push({
+          functionCall: {
+            name,
+            args: block.input && typeof block.input === "object" ? block.input : {}
+          }
+        });
+        continue;
+      }
+
+      if (block.type === "tool_result") {
+        const toolUseId = typeof block.tool_use_id === "string" ? block.tool_use_id : "";
+        const toolName = toolUseNameById.get(toolUseId);
+        if (!toolName) continue;
+        parts.push({
+          functionResponse: {
+            name: toolName,
+            response: normalizeAnthropicToolResultResponse(block.content, block.is_error)
+          }
+        });
+      }
+    }
+
+    if (!parts.length) continue;
 
     if (role === "assistant") {
-      contents.push({ role: "model", parts: [{ text }] });
+      contents.push({ role: "model", parts });
       continue;
     }
 
-    contents.push({ role: "user", parts: [{ text }] });
+    contents.push({ role: "user", parts });
   }
 
   const generationConfig = {};
@@ -140,6 +450,9 @@ function buildGeminiRequestFromAnthropic({ system, messages, temperature, top_p,
   const mt = coerceNumber(max_tokens);
   if (mt !== undefined) generationConfig.maxOutputTokens = mt;
 
+  const stopSequences = normalizeStopSequences(stop_sequences);
+  if (stopSequences.length) generationConfig.stopSequences = stopSequences;
+
   const payload = {
     contents: contents.length ? contents : [{ role: "user", parts: [{ text: "" }] }]
   };
@@ -151,6 +464,12 @@ function buildGeminiRequestFromAnthropic({ system, messages, temperature, top_p,
   if (Object.keys(generationConfig).length) {
     payload.generationConfig = generationConfig;
   }
+
+  const geminiTools = buildGeminiToolsFromAnthropic(tools);
+  if (geminiTools) payload.tools = geminiTools;
+
+  const geminiToolConfig = buildGeminiToolConfigFromAnthropic(tool_choice);
+  if (geminiToolConfig) payload.toolConfig = geminiToolConfig;
 
   if (stream) {
     payload.stream = true;
@@ -197,6 +516,24 @@ function writeSseDone(res) {
 function writeSseEvent(res, event, data) {
   res.write(`event: ${event}\n`);
   res.write(`data: ${JSON.stringify(data)}\n\n`);
+}
+
+function parseGeminiStreamLine(line) {
+  const trimmed = String(line || "").trim();
+  if (!trimmed) return undefined;
+  const payload = trimmed.startsWith("data:") ? trimmed.slice(5).trim() : trimmed;
+  if (!payload || payload === "[DONE]") return undefined;
+  try {
+    return JSON.parse(payload);
+  } catch {
+    return undefined;
+  }
+}
+
+function estimateTokens(text) {
+  const value = typeof text === "string" ? text : "";
+  if (!value) return 0;
+  return Math.max(1, Math.ceil(value.length / 4));
 }
 
 app.get("/healthz", (req, res) => {
@@ -290,15 +627,8 @@ app.post("/v1/chat/completions", async (req, res) => {
         buffer = lines.pop() || "";
 
         for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed) continue;
-
-          let json;
-          try {
-            json = JSON.parse(trimmed);
-          } catch {
-            continue;
-          }
+          const json = parseGeminiStreamLine(line);
+          if (!json) continue;
 
           const candidate = Array.isArray(json?.candidates) ? json.candidates[0] : undefined;
           const deltaText = extractTextFromGeminiCandidate(candidate);
@@ -380,6 +710,7 @@ app.post("/v1/messages", async (req, res) => {
   const normalizedModel = normalizeModel(body.model);
   const maxTokens = typeof body.max_tokens === "number" ? body.max_tokens : undefined;
   const stream = Boolean(body.stream);
+  const stopSequences = normalizeStopSequences(body.stop_sequences);
 
   const payload = buildGeminiRequestFromAnthropic({
     system: body.system,
@@ -387,7 +718,10 @@ app.post("/v1/messages", async (req, res) => {
     temperature: body.temperature,
     top_p: body.top_p,
     max_tokens: maxTokens,
-    stream
+    stream,
+    tools: body.tools,
+    tool_choice: body.tool_choice,
+    stop_sequences: stopSequences
   });
 
   const id = randomId("msg");
@@ -412,11 +746,14 @@ app.post("/v1/messages", async (req, res) => {
         }
       });
 
-      writeSseEvent(res, "content_block_start", {
-        type: "content_block_start",
-        index: 0,
-        content_block: { type: "text", text: "" }
-      });
+      let textBlockStarted = false;
+      let textBlockIndex = -1;
+      let stopReason = "end_turn";
+      let stopSequence = null;
+      let inputTokens = 0;
+      let outputTokens = 0;
+      const emittedToolUses = new Set();
+      let nextContentBlockIndex = 0;
 
       const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
         normalizedModel
@@ -448,33 +785,91 @@ app.post("/v1/messages", async (req, res) => {
         buffer = lines.pop() || "";
 
         for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed) continue;
-
-          let json;
-          try {
-            json = JSON.parse(trimmed);
-          } catch {
-            continue;
-          }
+          const json = parseGeminiStreamLine(line);
+          if (!json) continue;
 
           const candidate = Array.isArray(json?.candidates) ? json.candidates[0] : undefined;
-          const deltaText = extractTextFromGeminiCandidate(candidate);
-          if (!deltaText) continue;
+          if (!candidate) continue;
 
-          writeSseEvent(res, "content_block_delta", {
-            type: "content_block_delta",
-            index: 0,
-            delta: { type: "text_delta", text: deltaText }
-          });
+          const promptTokenCount = json?.usageMetadata?.promptTokenCount;
+          if (typeof promptTokenCount === "number") {
+            inputTokens = Math.max(inputTokens, promptTokenCount);
+          }
+          const candidatesTokenCount = json?.usageMetadata?.candidatesTokenCount;
+          if (typeof candidatesTokenCount === "number") {
+            outputTokens = Math.max(outputTokens, candidatesTokenCount);
+          }
+
+          const deltaText = extractTextFromGeminiCandidate(candidate);
+          if (deltaText) {
+            if (!textBlockStarted) {
+              writeSseEvent(res, "content_block_start", {
+                type: "content_block_start",
+                index: nextContentBlockIndex,
+                content_block: { type: "text", text: "" }
+              });
+              textBlockStarted = true;
+              textBlockIndex = nextContentBlockIndex;
+              nextContentBlockIndex += 1;
+            }
+            writeSseEvent(res, "content_block_delta", {
+              type: "content_block_delta",
+              index: textBlockIndex,
+              delta: { type: "text_delta", text: deltaText }
+            });
+            if (typeof candidatesTokenCount !== "number") {
+              outputTokens += estimateTokens(deltaText);
+            }
+          }
+
+          const calls = extractGeminiFunctionCalls(candidate);
+          for (const call of calls) {
+            const input = call.input;
+            const name = call.name;
+            const dedupeKey = `${name}:${JSON.stringify(input)}`;
+            if (emittedToolUses.has(dedupeKey)) continue;
+            emittedToolUses.add(dedupeKey);
+            stopReason = "tool_use";
+            const toolUse = {
+              type: "tool_use",
+              id: randomId("toolu"),
+              name,
+              input
+            };
+            writeSseEvent(res, "content_block_start", {
+              type: "content_block_start",
+              index: nextContentBlockIndex,
+              content_block: toolUse
+            });
+            writeSseEvent(res, "content_block_stop", {
+              type: "content_block_stop",
+              index: nextContentBlockIndex
+            });
+            nextContentBlockIndex += 1;
+          }
+
+          if (stopReason !== "tool_use") {
+            const stopState = deriveAnthropicStopState({
+              candidate,
+              hasToolCall: false,
+              stopSequences
+            });
+            stopReason = stopState.stopReason;
+            stopSequence = stopState.stopSequence;
+          }
         }
       }
 
-      writeSseEvent(res, "content_block_stop", { type: "content_block_stop", index: 0 });
+      if (textBlockStarted) {
+        writeSseEvent(res, "content_block_stop", {
+          type: "content_block_stop",
+          index: textBlockIndex
+        });
+      }
       writeSseEvent(res, "message_delta", {
         type: "message_delta",
-        delta: { stop_reason: "end_turn", stop_sequence: null },
-        usage: { output_tokens: 0 }
+        delta: { stop_reason: stopReason, stop_sequence: stopSequence },
+        usage: { input_tokens: inputTokens, output_tokens: outputTokens }
       });
       writeSseEvent(res, "message_stop", { type: "message_stop" });
       res.end();
@@ -502,7 +897,10 @@ app.post("/v1/messages", async (req, res) => {
 
     const json = await upstream.json();
     const candidate = Array.isArray(json?.candidates) ? json.candidates[0] : undefined;
-    const text = extractTextFromGeminiCandidate(candidate);
+    const { content, stopReason, stopSequence } = extractAnthropicBlocksFromGeminiCandidate(
+      candidate,
+      stopSequences
+    );
 
     const inputTokens = json?.usageMetadata?.promptTokenCount;
     const outputTokens = json?.usageMetadata?.candidatesTokenCount;
@@ -512,9 +910,9 @@ app.post("/v1/messages", async (req, res) => {
       type: "message",
       role: "assistant",
       model: body.model || normalizedModel,
-      content: [{ type: "text", text: text ?? "" }],
-      stop_reason: "end_turn",
-      stop_sequence: null,
+      content: content.length ? content : [{ type: "text", text: "" }],
+      stop_reason: stopReason,
+      stop_sequence: stopSequence,
       usage: {
         input_tokens: typeof inputTokens === "number" ? inputTokens : 0,
         output_tokens: typeof outputTokens === "number" ? outputTokens : 0
