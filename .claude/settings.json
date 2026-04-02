@@ -1,0 +1,9 @@
+{
+  "env": {
+    "ANTHROPIC_API_KEY": "none",
+    "ANTHROPIC_AUTH_TOKEN": "none",
+    "ANTHROPIC_BASE_URL": "http://localhost:8787",
+    "ANTHROPIC_MODEL":"google/gemini-2.5-flash",
+    "API_TIMEOUT_MS": "3000000"
+  }
+}
