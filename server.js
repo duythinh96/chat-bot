@@ -39,14 +39,14 @@ function extractBearerToken(authorizationHeaderValue) {
 }
 
 function getGeminiApiKey(req) {
-  const envKey = process.env.GEMINI_API_KEY;
-  if (typeof envKey === "string" && envKey.trim()) return envKey.trim();
-
   const xApiKey = req.get("x-api-key");
   if (typeof xApiKey === "string" && xApiKey.trim()) return xApiKey.trim();
 
   const bearer = extractBearerToken(req.get("authorization"));
   if (bearer) return bearer;
+
+  const envKey = process.env.GEMINI_API_KEY;
+  if (typeof envKey === "string" && envKey.trim()) return envKey.trim();
 
   return "";
 }
